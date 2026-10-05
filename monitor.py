@@ -1,17 +1,16 @@
-import argparse
-import hashlib
 import json
 import os
-import re
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from openai import AzureOpenAI
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 
 # ============================================================
@@ -20,24 +19,45 @@ from openai import AzureOpenAI
 
 load_dotenv()
 
-client = AzureOpenAI(
-    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-    api_key=os.environ["AZURE_OPENAI_API_KEY"],
-    api_version=os.environ["AZURE_OPENAI_API_VERSION"],
-)
-
 TRAINING_URL = os.getenv(
     "TRAINING_URL",
     "https://youth.europa.eu/solidarity/dashboard/training-humanitarian-aid_en",
 )
 
+AUTH_FILE = Path("auth_state.json")
+
+PAGE_TIMEOUT = 60_000
+
+
+# ============================================================
+# Environment variables
+# ============================================================
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-PROFILE_DIR = Path("playwright_profile")
-STATE_FILE = Path("state.json")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-PAGE_TIMEOUT = 60_000
+
+# ============================================================
+# Azure OpenAI
+# ============================================================
+
+client = None
+
+if (
+    AZURE_OPENAI_ENDPOINT
+    and AZURE_OPENAI_API_KEY
+    and AZURE_OPENAI_API_VERSION
+):
+    client = AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
 
 
 # ============================================================
@@ -47,17 +67,39 @@ PAGE_TIMEOUT = 60_000
 def validate_config():
     missing = []
 
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
+    required_variables = {
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+        "AZURE_OPENAI_ENDPOINT": AZURE_OPENAI_ENDPOINT,
+        "AZURE_OPENAI_API_KEY": AZURE_OPENAI_API_KEY,
+        "AZURE_OPENAI_API_VERSION": AZURE_OPENAI_API_VERSION,
+        "AZURE_OPENAI_DEPLOYMENT": AZURE_OPENAI_DEPLOYMENT,
+    }
 
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
+    for name, value in required_variables.items():
+        if not value:
+            missing.append(name)
+
+    if not AUTH_FILE.exists():
+        print(
+            f"Missing authentication file: "
+            f"{AUTH_FILE.absolute()}"
+        )
+        print()
+        print(
+            "Make sure auth_state.json exists."
+        )
+        sys.exit(1)
 
     if missing:
-        print(
-            "Missing environment variables:\n"
-            + "\n".join(f"  - {x}" for x in missing)
-        )
+        print()
+        print("Missing environment variables:")
+        print()
+
+        for variable in missing:
+            print(f"  - {variable}")
+
+        print()
         sys.exit(1)
 
 
@@ -67,7 +109,7 @@ def validate_config():
 
 def send_telegram(message: str):
     """
-    Send a Telegram notification.
+    Send a Telegram message.
     """
 
     url = (
@@ -93,77 +135,69 @@ def send_telegram(message: str):
 
 
 # ============================================================
-# State
-# ============================================================
-
-def load_state():
-    if not STATE_FILE.exists():
-        return None
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Could not read state file: {e}")
-        return None
-
-
-def save_state(state):
-    temp_file = STATE_FILE.with_suffix(".tmp")
-
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(
-            state,
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    temp_file.replace(STATE_FILE)
-
-
-# ============================================================
 # Text processing
 # ============================================================
 
 def normalize_text(text: str) -> str:
     """
-    Normalize whitespace so tiny formatting changes don't
-    trigger a notification.
+    Normalize whitespace.
     """
 
     text = text.replace("\xa0", " ")
 
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
+    text = " ".join(text.split())
 
     return text.strip()
 
 
-def fingerprint(text: str) -> str:
-    return hashlib.sha256(
-        text.encode("utf-8")
-    ).hexdigest()
+# ============================================================
+# Page text extraction
+# ============================================================
+
+def extract_page_text(page) -> str:
+    """
+    Extract all visible text from the page.
+    """
+
+    try:
+        body_text = page.locator(
+            "body"
+        ).inner_text(
+            timeout=10_000
+        )
+
+    except Exception as e:
+
+        print(
+            f"Could not read page body: {e}"
+        )
+
+        return ""
+
+    return normalize_text(body_text)
 
 
 # ============================================================
-# Page classification
+# AI classification
 # ============================================================
 
+def classify_with_ai(page_text: str):
+    """
+    Classify the current Humanitarian Aid training page.
 
-def classify_with_ai(page_text: str, previous_status: str | None):
+    Returns:
+
+        OPEN
+        CLOSED
+        UNKNOWN
+    """
+
     prompt = f"""
 You are monitoring the European Youth Portal page for
 Humanitarian Aid Volunteering training.
 
 Your job is ONLY to determine whether registration/access is
 currently open.
-
-Previous known status:
-{previous_status or "NONE"}
 
 CURRENT PAGE TEXT:
 ------------------
@@ -194,28 +228,32 @@ the status, or the page is a login page, error page, CAPTCHA,
 server error, incomplete page, unrelated page, etc.
 
 Important:
+
 - Do NOT infer that registration is open merely because the page
   contains words such as "open", "available", "opportunities",
   "activities", etc.
-- Look specifically at Humanitarian Aid Volunteering training
-  registration/access.
-- Do not use the previous status as evidence for the current status.
-- Do not guess.
+
+- Look specifically at Humanitarian Aid Volunteering
+  training registration/access.
+
+- Do NOT guess.
+
 - If there is ambiguity, return UNKNOWN.
-- Base your decision only on the supplied page text.
+
+- Base your decision ONLY on the supplied page text.
 
 Return ONLY valid JSON:
 
 {{
-  "status": "OPEN | CLOSED | UNKNOWN",
-  "confidence": 0.0,
-  "reason": "short explanation",
-  "evidence": "short exact relevant excerpt"
+    "status": "OPEN | CLOSED | UNKNOWN",
+    "confidence": 0.0,
+    "reason": "short explanation",
+    "evidence": "short exact relevant excerpt"
 }}
 """
 
     response = client.chat.completions.create(
-        model=os.environ["AZURE_OPENAI_DEPLOYMENT"],
+        model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
             {
                 "role": "system",
@@ -235,216 +273,153 @@ Return ONLY valid JSON:
         },
     )
 
-    result = json.loads(
-        response.choices[0].message.content
-    )
+    content = response.choices[0].message.content
 
-    return result
+    if not content:
+        raise RuntimeError(
+            "Azure OpenAI returned an empty response."
+        )
 
+    result = json.loads(content)
 
-# ============================================================
-# Relevant content extraction
-# ============================================================
+    # --------------------------------------------------------
+    # Validate status
+    # --------------------------------------------------------
 
-def extract_relevant_text(page):
-    """
-    Try to isolate the actual training page text.
+    status = result.get("status")
 
-    We intentionally use the whole body as a fallback because
-    the site's DOM can change.
-    """
+    if status not in {
+        "OPEN",
+        "CLOSED",
+        "UNKNOWN",
+    }:
+        status = "UNKNOWN"
+
+    # --------------------------------------------------------
+    # Validate confidence
+    # --------------------------------------------------------
 
     try:
-        body_text = page.locator("body").inner_text(
-            timeout=10_000
+        confidence = float(
+            result.get("confidence", 0)
         )
-    except Exception:
-        return ""
 
-    normalized = normalize_text(body_text)
+    except (TypeError, ValueError):
 
-    # We care especially about text around:
-    # Humanitarian Aid
-    # registration
-    # online training
-    # face-to-face training
+        confidence = 0.0
 
-    keywords = [
-        "humanitarian aid",
-        "online training",
-        "face-to-face",
-        "registration",
-        "volunteering",
+    confidence = max(
+        0.0,
+        min(1.0, confidence),
+    )
+
+    return {
+        "status": status,
+        "confidence": confidence,
+        "reason": str(
+            result.get("reason", "")
+        ),
+        "evidence": str(
+            result.get("evidence", "")
+        ),
+    }
+
+
+# ============================================================
+# Authentication detection
+# ============================================================
+
+def is_authentication_page(
+    current_url: str,
+    page_text: str,
+) -> bool:
+    """
+    Detect obvious authentication redirects.
+
+    Authentication failures are reported as UNKNOWN rather
+    than CLOSED.
+    """
+
+    url = current_url.lower()
+
+    auth_url_patterns = [
+        "/login",
+        "/signin",
+        "/sign-in",
+        "/authenticate",
+        "/account/login",
     ]
 
-    if not any(
-        keyword.lower() in normalized.lower()
-        for keyword in keywords
+    if any(
+        pattern in url
+        for pattern in auth_url_patterns
     ):
-        return normalized
+        return True
 
-    # Keep the complete page text for fingerprinting.
-    # This avoids accidentally missing a changed sentence.
-    return normalized
+    text = page_text.lower()
+
+    auth_phrases = [
+        "log in to your account",
+        "sign in to your account",
+        "please log in",
+        "please sign in",
+    ]
+
+    return any(
+        phrase in text
+        for phrase in auth_phrases
+    )
 
 
 # ============================================================
-# Browser
+# Telegram message
 # ============================================================
 
-def launch_browser(playwright):
+def build_telegram_message(
+    status: str,
+    confidence: float,
+    reason: str,
+    evidence: str,
+    url: str,
+):
     """
-    Persistent Chromium profile.
-
-    The important part is user_data_dir.
-    Cookies/local storage/login state remain there.
+    Build the Telegram message containing the current state.
     """
 
-    PROFILE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    emoji = {
+        "OPEN": "🟢",
+        "CLOSED": "🔴",
+        "UNKNOWN": "🟡",
+    }.get(
+        status,
+        "⚪",
     )
 
-    browser = playwright.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR.absolute()),
-        headless=True,
-
-        # Useful for sites that behave differently depending
-        # on browser automation flags.
-        args=[
-            "--disable-blink-features=AutomationControlled",
-        ],
-
-        viewport={
-            "width": 1440,
-            "height": 1000,
-        },
+    return (
+        f"{emoji} Humanitarian Aid Training Monitor\n\n"
+        f"Status: {status}\n"
+        f"Confidence: {confidence:.0%}\n\n"
+        f"Reason:\n"
+        f"{reason}\n\n"
+        f"Evidence:\n"
+        f"{evidence}\n\n"
+        f"URL:\n"
+        f"{url}"
     )
-
-    return browser
 
 
 # ============================================================
-# Login mode
-# ============================================================
-
-def login_mode():
-    print()
-    print("=" * 70)
-    print("LOGIN MODE")
-    print("=" * 70)
-    print()
-    print("A browser will open.")
-    print()
-    print("Log in to the European Youth Portal normally.")
-    print()
-    print(
-        "When you can access the Humanitarian Aid training page, "
-        "come back to this terminal."
-    )
-    print()
-
-    with sync_playwright() as p:
-
-        PROFILE_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        browser = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR.absolute()),
-            headless=False,
-            viewport={
-                "width": 1440,
-                "height": 1000,
-            },
-        )
-
-        page = browser.new_page()
-
-        try:
-            page.goto(
-                TRAINING_URL,
-                wait_until="domcontentloaded",
-                timeout=PAGE_TIMEOUT,
-            )
-        except Exception as e:
-            print(f"Initial navigation error: {e}")
-
-        print()
-        print("Browser is open.")
-        print()
-        input(
-            "Press ENTER here after you have finished logging in..."
-        )
-
-        try:
-            page.goto(
-                TRAINING_URL,
-                wait_until="domcontentloaded",
-                timeout=PAGE_TIMEOUT,
-            )
-
-            time.sleep(3)
-
-            text = page.locator("body").inner_text(
-                timeout=10_000
-            )
-
-            ai_result = classify_with_ai(text)
-
-            status = ai_result["status"]
-
-            print("AI status:", status)
-            print("Confidence:", ai_result["confidence"])
-            print("Reason:", ai_result["reason"])
-            print("Evidence:", ai_result["evidence"])
-            print()
-            print("Page status:", status)
-            print()
-
-            if status == "UNKNOWN":
-                print(
-                    "WARNING: I could not confidently identify "
-                    "the training page status."
-                )
-                print(
-                    "The saved browser session may still be valid."
-                )
-            else:
-                print(
-                    "Login/session appears usable."
-                )
-
-        except Exception as e:
-            print(
-                f"Could not verify page: {e}"
-            )
-
-        print()
-        print(
-            "Your browser session has been saved to:"
-        )
-        print(
-            PROFILE_DIR.absolute()
-        )
-        print()
-
-        input(
-            "Press ENTER to close the browser..."
-        )
-
-        browser.close()
-
-
-# ============================================================
-# Monitoring
+# Main monitor
 # ============================================================
 
 def monitor():
-    validate_config()
+    """
+    Run one monitoring cycle.
 
-    previous_state = load_state()
+    Every execution sends the current state to Telegram.
+    """
+
+    validate_config()
 
     print()
     print("=" * 70)
@@ -459,50 +434,53 @@ def monitor():
 
     with sync_playwright() as p:
 
-        browser = launch_browser(p)
+        browser = None
 
         try:
 
-            page = browser.pages[0]
-
-            if not page:
-                page = browser.new_page()
+            # ------------------------------------------------
+            # Launch browser
+            # ------------------------------------------------
 
             print()
-            print("Opening page...")
+            print(
+                "Launching browser..."
+            )
+
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+
+            context = browser.new_context(
+                storage_state=str(
+                    AUTH_FILE.absolute()
+                ),
+                viewport={
+                    "width": 1440,
+                    "height": 1000,
+                },
+            )
+
+            page = context.new_page()
+
+            # ------------------------------------------------
+            # Open page
+            # ------------------------------------------------
+
+            print(
+                "Opening page..."
+            )
 
             try:
+
                 response = page.goto(
                     TRAINING_URL,
                     wait_until="domcontentloaded",
                     timeout=PAGE_TIMEOUT,
                 )
-
-                if response:
-                    print(
-                        "HTTP status:",
-                        response.status,
-                    )
-
-                    # Don't classify HTTP failures as CLOSED.
-                    if response.status >= 400:
-                        print(
-                            "HTTP error. Treating status as UNKNOWN."
-                        )
-
-                        current_state = {
-                            "status": "UNKNOWN",
-                            "fingerprint": None,
-                            "timestamp": datetime.now().isoformat(),
-                            "reason": f"HTTP {response.status}",
-                        }
-
-                        handle_result(
-                            previous_state,
-                            current_state,
-                        )
-
-                        return
 
             except PlaywrightTimeoutError:
 
@@ -510,16 +488,14 @@ def monitor():
                     "Page load timed out."
                 )
 
-                current_state = {
-                    "status": "UNKNOWN",
-                    "fingerprint": None,
-                    "timestamp": datetime.now().isoformat(),
-                    "reason": "Page timeout",
-                }
-
-                handle_result(
-                    previous_state,
-                    current_state,
+                send_telegram(
+                    build_telegram_message(
+                        status="UNKNOWN",
+                        confidence=1.0,
+                        reason="Page load timed out.",
+                        evidence="",
+                        url=page.url,
+                    )
                 )
 
                 return
@@ -530,26 +506,51 @@ def monitor():
                     f"Navigation failed: {e}"
                 )
 
-                current_state = {
-                    "status": "UNKNOWN",
-                    "fingerprint": None,
-                    "timestamp": datetime.now().isoformat(),
-                    "reason": str(e),
-                }
-
-                handle_result(
-                    previous_state,
-                    current_state,
+                send_telegram(
+                    build_telegram_message(
+                        status="UNKNOWN",
+                        confidence=1.0,
+                        reason=f"Navigation failed: {e}",
+                        evidence="",
+                        url=page.url,
+                    )
                 )
 
                 return
 
-            # Give JavaScript a little time to finish rendering.
-            time.sleep(3)
+            # ------------------------------------------------
+            # HTTP status
+            # ------------------------------------------------
+
+            if response:
+
+                print(
+                    "HTTP status:",
+                    response.status,
+                )
+
+                if response.status >= 400:
+
+                    send_telegram(
+                        build_telegram_message(
+                            status="UNKNOWN",
+                            confidence=1.0,
+                            reason=(
+                                f"Website returned HTTP "
+                                f"{response.status}."
+                            ),
+                            evidence="",
+                            url=page.url,
+                        )
+                    )
+
+                    return
 
             # ------------------------------------------------
-            # Detect login/authentication
+            # Allow JavaScript to render
             # ------------------------------------------------
+
+            time.sleep(3)
 
             current_url = page.url
 
@@ -558,356 +559,158 @@ def monitor():
                 current_url,
             )
 
-            # If we were redirected somewhere obviously related
-            # to authentication, don't classify it.
-            auth_url_patterns = [
-                "/login",
-                "/signin",
-                "/sign-in",
-                "/authenticate",
-            ]
+            # ------------------------------------------------
+            # Extract page text
+            # ------------------------------------------------
 
-            if any(
-                x in current_url.lower()
-                for x in auth_url_patterns
+            page_text = extract_page_text(
+                page
+            )
+
+            if not page_text:
+
+                send_telegram(
+                    build_telegram_message(
+                        status="UNKNOWN",
+                        confidence=1.0,
+                        reason="Page contains no readable text.",
+                        evidence="",
+                        url=current_url,
+                    )
+                )
+
+                return
+
+            print(
+                "Page text length:",
+                len(page_text),
+            )
+
+            # ------------------------------------------------
+            # Authentication check
+            # ------------------------------------------------
+
+            if is_authentication_page(
+                current_url,
+                page_text,
             ):
-                current_state = {
-                    "status": "UNKNOWN",
-                    "fingerprint": None,
-                    "timestamp": datetime.now().isoformat(),
-                    "reason": "Authentication page",
-                }
 
-                handle_result(
-                    previous_state,
-                    current_state,
+                print(
+                    "Authentication appears to have expired."
+                )
+
+                send_telegram(
+                    build_telegram_message(
+                        status="UNKNOWN",
+                        confidence=1.0,
+                        reason=(
+                            "The saved authentication state "
+                            "appears to have expired."
+                        ),
+                        evidence=(
+                            "Authentication/login page detected."
+                        ),
+                        url=current_url,
+                    )
                 )
 
                 return
 
             # ------------------------------------------------
-            # Read page
+            # AI classification
             # ------------------------------------------------
 
-            text = extract_relevant_text(page)
+            print()
+            print(
+                "Classifying page..."
+            )
 
-            if not text:
+            try:
 
-                current_state = {
-                    "status": "UNKNOWN",
-                    "fingerprint": None,
-                    "timestamp": datetime.now().isoformat(),
-                    "reason": "Empty page",
-                }
+                result = classify_with_ai(
+                    page_text
+                )
 
-                handle_result(
-                    previous_state,
-                    current_state,
+            except Exception as e:
+
+                print(
+                    f"AI classification failed: {e}"
+                )
+
+                send_telegram(
+                    build_telegram_message(
+                        status="UNKNOWN",
+                        confidence=1.0,
+                        reason=(
+                            f"AI classification failed: {e}"
+                        ),
+                        evidence="",
+                        url=current_url,
+                    )
                 )
 
                 return
 
+            status = result["status"]
+            confidence = result["confidence"]
+            reason = result["reason"]
+            evidence = result["evidence"]
+
             # ------------------------------------------------
-            # Classify
+            # Print result
             # ------------------------------------------------
-
-            ai_result = classify_with_ai(
-                    text,
-                    previous_state.get("status") if previous_state else None,
-                )
-
-            if (
-                ai_result["status"] == "OPEN"
-                and ai_result["confidence"] >= 0.90
-            ):
-                status = "OPEN"
-
-            elif (
-                ai_result["status"] == "CLOSED"
-                and ai_result["confidence"] >= 0.90
-            ):
-                status = "CLOSED"
-
-            else:
-                status = "UNKNOWN"
-
-            print("AI status:", status)
-            print("Confidence:", ai_result["confidence"])
-            print("Reason:", ai_result["reason"])
-            print("Evidence:", ai_result["evidence"])
-
-            page_hash = fingerprint(text)
-
-            current_state = {
-                "status": status,
-                "fingerprint": page_hash,
-                "timestamp": datetime.now().isoformat(),
-                "url": current_url,
-                "reason": None,
-            }
 
             print()
-            print("Detected status:", status)
-            print("Fingerprint:", page_hash[:16])
+            print("=" * 70)
+            print("RESULT")
+            print("=" * 70)
+            print()
+
+            print(
+                f"Status: {status}"
+            )
+
+            print(
+                f"Confidence: {confidence:.0%}"
+            )
+
+            print(
+                f"Reason: {reason}"
+            )
+
+            print(
+                f"Evidence: {evidence}"
+            )
+
             print()
 
             # ------------------------------------------------
-            # Handle result
+            # Send current state to Telegram
             # ------------------------------------------------
 
-            handle_result(
-                previous_state,
-                current_state,
-                page_text=text,
+            message = build_telegram_message(
+                status=status,
+                confidence=confidence,
+                reason=reason,
+                evidence=evidence,
+                url=current_url,
+            )
+
+            send_telegram(
+                message
             )
 
         finally:
-            browser.close()
+
+            if browser:
+
+                browser.close()
 
 
 # ============================================================
-# Result handling
+# Entry point
 # ============================================================
-
-def handle_result(
-    previous_state,
-    current_state,
-    page_text=None,
-):
-    current_status = current_state["status"]
-
-    # --------------------------------------------------------
-    # UNKNOWN
-    # --------------------------------------------------------
-
-    if current_status == "UNKNOWN":
-
-        print(
-            "Result is UNKNOWN."
-        )
-
-        print(
-            "No notification will be sent."
-        )
-
-        # Don't overwrite a known good state with UNKNOWN.
-        if previous_state:
-            print(
-                "Keeping previous known state:",
-                previous_state.get("status"),
-            )
-
-        else:
-            save_state(current_state)
-
-        return
-
-    # --------------------------------------------------------
-    # First successful run
-    # --------------------------------------------------------
-
-    if previous_state is None:
-
-        print(
-            "First successful run."
-        )
-
-        print(
-            "Saving baseline without notification."
-        )
-
-        save_state(current_state)
-
-        return
-
-    previous_status = previous_state.get(
-        "status"
-    )
-
-    previous_hash = previous_state.get(
-        "fingerprint"
-    )
-
-    current_hash = current_state.get(
-        "fingerprint"
-    )
-
-    print(
-        "Previous status:",
-        previous_status,
-    )
-
-    # --------------------------------------------------------
-    # CLOSED -> OPEN
-    # --------------------------------------------------------
-
-    if (
-        previous_status == "CLOSED"
-        and current_status == "OPEN"
-    ):
-
-        message = (
-            "🚨 Humanitarian Aid Training Update\n\n"
-            "Registration/access appears to be OPEN.\n\n"
-            "The European Youth Portal page has changed "
-            "from the previous CLOSED state.\n\n"
-            f"{TRAINING_URL}"
-        )
-
-        send_telegram(message)
-
-        save_state(current_state)
-
-        return
-
-    # --------------------------------------------------------
-    # OPEN remains OPEN
-    # --------------------------------------------------------
-
-    if (
-        previous_status == "OPEN"
-        and current_status == "OPEN"
-    ):
-
-        if previous_hash != current_hash:
-
-            message = (
-                "🔔 Humanitarian Aid Training Update\n\n"
-                "The Humanitarian Aid training page has "
-                "changed while registration/access appears OPEN.\n\n"
-                f"{TRAINING_URL}"
-            )
-
-            send_telegram(message)
-
-        else:
-
-            print(
-                "Still OPEN. No change."
-            )
-
-        save_state(current_state)
-
-        return
-
-    # --------------------------------------------------------
-    # CLOSED remains CLOSED
-    # --------------------------------------------------------
-
-    if (
-        previous_status == "CLOSED"
-        and current_status == "CLOSED"
-    ):
-
-        print(
-            "Still CLOSED."
-        )
-
-        # Ignore harmless page changes while the explicit
-        # closure notice remains present.
-        if previous_hash != current_hash:
-            print(
-                "Page fingerprint changed, but status "
-                "remains CLOSED. No notification."
-            )
-
-        save_state(current_state)
-
-        return
-
-    # --------------------------------------------------------
-    # UNKNOWN -> known
-    # --------------------------------------------------------
-
-    if (
-        previous_status == "UNKNOWN"
-        and current_status == "OPEN"
-    ):
-
-        message = (
-            "🚨 Humanitarian Aid Training Update\n\n"
-            "The training page is now readable and "
-            "registration/access appears OPEN.\n\n"
-            f"{TRAINING_URL}"
-        )
-
-        send_telegram(message)
-
-        save_state(current_state)
-
-        return
-
-    if (
-        previous_status == "UNKNOWN"
-        and current_status == "CLOSED"
-    ):
-
-        print(
-            "Page is readable again and remains CLOSED."
-        )
-
-        save_state(current_state)
-
-        return
-
-    # --------------------------------------------------------
-    # Any other transition
-    # --------------------------------------------------------
-
-    if previous_status != current_status:
-
-        message = (
-            "🔔 Humanitarian Aid Training Update\n\n"
-            f"Previous status: {previous_status}\n"
-            f"Current status: {current_status}\n\n"
-            f"{TRAINING_URL}"
-        )
-
-        send_telegram(message)
-
-    save_state(current_state)
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--login",
-        action="store_true",
-        help="Open a visible browser so you can log in.",
-    )
-
-    parser.add_argument(
-        "--test-telegram",
-        action="store_true",
-        help="Send a test Telegram notification.",
-    )
-
-    args = parser.parse_args()
-
-    if args.test_telegram:
-
-        validate_config()
-
-        send_telegram(
-            "✅ Humanitarian Aid monitor is connected correctly."
-        )
-
-        return
-
-    if args.login:
-
-        login_mode()
-
-        return
-
-    monitor()
-
 
 if __name__ == "__main__":
-    main()
+
+    monitor()

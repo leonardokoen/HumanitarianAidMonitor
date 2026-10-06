@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import time
-from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -24,14 +23,36 @@ TRAINING_URL = os.getenv(
     "https://youth.europa.eu/solidarity/dashboard/training-humanitarian-aid_en",
 )
 
-AUTH_FILE = Path("auth_state.json")
+LOGIN_URL = "https://ecas.ec.europa.eu/cas/login"
 
 PAGE_TIMEOUT = 60_000
+
+# Maximum time to wait for MFA approval
+MFA_TIMEOUT = 300  # 5 minutes
+
+# How often to check whether authentication completed
+MFA_CHECK_INTERVAL = 3
+
+
+# ============================================================
+# ECAS selectors
+# ============================================================
+
+USERNAME_XPATH = '//*[@id="username"]'
+
+NEXT_XPATH = '//*[@id="whoamiForm"]/div[2]/div[2]/button'
+
+PASSWORD_XPATH = '//*[@id="password"]'
+
+SIGN_IN_XPATH = '//*[@id="loginForm"]/div/div[9]/input'
 
 
 # ============================================================
 # Environment variables
 # ============================================================
+
+ECAS_USERNAME = os.getenv("ECAS_USERNAME")
+ECAS_PASSWORD = os.getenv("ECAS_PASSWORD")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -68,6 +89,8 @@ def validate_config():
     missing = []
 
     required_variables = {
+        "ECAS_USERNAME": ECAS_USERNAME,
+        "ECAS_PASSWORD": ECAS_PASSWORD,
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
         "AZURE_OPENAI_ENDPOINT": AZURE_OPENAI_ENDPOINT,
@@ -80,17 +103,6 @@ def validate_config():
         if not value:
             missing.append(name)
 
-    if not AUTH_FILE.exists():
-        print(
-            f"Missing authentication file: "
-            f"{AUTH_FILE.absolute()}"
-        )
-        print()
-        print(
-            "Make sure auth_state.json exists."
-        )
-        sys.exit(1)
-
     if missing:
         print()
         print("Missing environment variables:")
@@ -100,6 +112,7 @@ def validate_config():
             print(f"  - {variable}")
 
         print()
+
         sys.exit(1)
 
 
@@ -175,6 +188,267 @@ def extract_page_text(page) -> str:
         return ""
 
     return normalize_text(body_text)
+
+
+# ============================================================
+# ECAS authentication
+# ============================================================
+
+def authenticate_with_ecas(page):
+    """
+    Perform a fresh ECAS login.
+
+    No authentication state is saved or restored.
+
+    The function:
+
+    1. Opens ECAS.
+    2. Enters username.
+    3. Clicks Next.
+    4. Enters password.
+    5. Selects the MFA method using the same keyboard
+       sequence as the working local RPA.
+    6. Submits the login.
+    7. Waits for the ECAS authentication flow to finish.
+
+    Returns True if authentication appears successful.
+    """
+
+    print()
+    print("=" * 70)
+    print("ECAS AUTHENTICATION")
+    print("=" * 70)
+    print()
+
+    # --------------------------------------------------------
+    # Open ECAS
+    # --------------------------------------------------------
+
+    print("Opening ECAS...")
+
+    try:
+
+        page.goto(
+            LOGIN_URL,
+            wait_until="domcontentloaded",
+            timeout=PAGE_TIMEOUT,
+        )
+
+    except Exception as e:
+
+        print(
+            f"Could not open ECAS: {e}"
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Username
+    # --------------------------------------------------------
+
+    print("Waiting for username field...")
+
+    try:
+
+        page.locator(
+            f"xpath={USERNAME_XPATH}"
+        ).wait_for(
+            state="visible",
+            timeout=30_000,
+        )
+
+    except PlaywrightTimeoutError:
+
+        print(
+            "Username field did not appear."
+        )
+
+        return False
+
+    print("Filling username...")
+
+    page.locator(
+        f"xpath={USERNAME_XPATH}"
+    ).fill(
+        ECAS_USERNAME
+    )
+
+    # --------------------------------------------------------
+    # Next
+    # --------------------------------------------------------
+
+    print("Clicking Next...")
+
+    try:
+
+        page.locator(
+            f"xpath={NEXT_XPATH}"
+        ).click(
+            timeout=30_000
+        )
+
+    except Exception as e:
+
+        print(
+            f"Could not click Next: {e}"
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Password
+    # --------------------------------------------------------
+
+    print("Waiting for password field...")
+
+    try:
+
+        page.locator(
+            f"xpath={PASSWORD_XPATH}"
+        ).wait_for(
+            state="visible",
+            timeout=30_000,
+        )
+
+    except PlaywrightTimeoutError:
+
+        print(
+            "Password field did not appear."
+        )
+
+        return False
+
+    print("Filling password...")
+
+    page.locator(
+        f"xpath={PASSWORD_XPATH}"
+    ).fill(
+        ECAS_PASSWORD
+    )
+
+    # --------------------------------------------------------
+    # MFA method
+    # --------------------------------------------------------
+
+    print()
+    print("Selecting MFA method...")
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # This is the exact keyboard sequence from your
+    # working RPA.
+    # --------------------------------------------------------
+
+    page.keyboard.press("Tab")
+
+    page.keyboard.press("Enter")
+
+    page.keyboard.press("ArrowDown")
+
+    page.keyboard.press("Enter")
+
+    # --------------------------------------------------------
+    # Submit login
+    # --------------------------------------------------------
+
+    print("Submitting ECAS login...")
+
+    page.locator(
+        f"xpath={PASSWORD_XPATH}"
+    ).press(
+        "Enter"
+    )
+
+    print()
+    print("ECAS login submitted.")
+    print("Waiting for MFA approval...")
+
+    # --------------------------------------------------------
+    # Notify phone
+    # --------------------------------------------------------
+
+    try:
+
+        send_telegram(
+            "🔐 ECAS login started.\n\n"
+            "MFA approval is required.\n"
+            "Please approve the login request in the "
+            "EU Login app on your iPhone.\n\n"
+            "The GitHub Actions job is waiting."
+        )
+
+    except Exception as e:
+
+        print(
+            f"Could not send MFA Telegram notification: {e}"
+        )
+
+    # --------------------------------------------------------
+    # Wait for authentication
+    # --------------------------------------------------------
+
+    start_time = time.time()
+
+    print()
+    print("Waiting for authentication...")
+    print()
+
+    while True:
+
+        elapsed = time.time() - start_time
+
+        if elapsed >= MFA_TIMEOUT:
+
+            print()
+            print("MFA timeout reached.")
+            print(f"Current URL: {page.url}")
+
+            return False
+
+        print(
+            f"Waiting for authentication... "
+            f"{int(elapsed)}s / {MFA_TIMEOUT}s"
+        )
+
+        # ----------------------------------------------------
+        # Authentication is successful when the page contains
+        # "Successful login"
+        # ----------------------------------------------------
+
+        try:
+
+            success_message = page.get_by_text(
+                "Successful login",
+                exact=False
+            )
+
+            if success_message.is_visible(timeout=500):
+
+                print()
+                print("Successful login detected.")
+                print("Current URL:", page.url)
+
+                try:
+
+                    send_telegram(
+                        "✅ ECAS authentication successful.\n\n"
+                        "Starting Humanitarian Aid Training monitor..."
+                    )
+
+                except Exception as e:
+
+                    print(
+                        f"Could not send Telegram notification: {e}"
+                    )
+
+                return True
+
+        except Exception:
+
+            pass
+
+        time.sleep(MFA_CHECK_INTERVAL)
 
 
 # ============================================================
@@ -276,23 +550,29 @@ Return ONLY valid JSON:
     content = response.choices[0].message.content
 
     if not content:
+
         raise RuntimeError(
             "Azure OpenAI returned an empty response."
         )
 
-    result = json.loads(content)
+    result = json.loads(
+        content
+    )
 
     # --------------------------------------------------------
     # Validate status
     # --------------------------------------------------------
 
-    status = result.get("status")
+    status = result.get(
+        "status"
+    )
 
     if status not in {
         "OPEN",
         "CLOSED",
         "UNKNOWN",
     }:
+
         status = "UNKNOWN"
 
     # --------------------------------------------------------
@@ -300,75 +580,45 @@ Return ONLY valid JSON:
     # --------------------------------------------------------
 
     try:
+
         confidence = float(
-            result.get("confidence", 0)
+            result.get(
+                "confidence",
+                0
+            )
         )
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
 
         confidence = 0.0
 
     confidence = max(
         0.0,
-        min(1.0, confidence),
+        min(
+            1.0,
+            confidence,
+        ),
     )
 
     return {
         "status": status,
         "confidence": confidence,
         "reason": str(
-            result.get("reason", "")
+            result.get(
+                "reason",
+                ""
+            )
         ),
         "evidence": str(
-            result.get("evidence", "")
+            result.get(
+                "evidence",
+                ""
+            )
         ),
     }
-
-
-# ============================================================
-# Authentication detection
-# ============================================================
-
-def is_authentication_page(
-    current_url: str,
-    page_text: str,
-) -> bool:
-    """
-    Detect obvious authentication redirects.
-
-    Authentication failures are reported as UNKNOWN rather
-    than CLOSED.
-    """
-
-    url = current_url.lower()
-
-    auth_url_patterns = [
-        "/login",
-        "/signin",
-        "/sign-in",
-        "/authenticate",
-        "/account/login",
-    ]
-
-    if any(
-        pattern in url
-        for pattern in auth_url_patterns
-    ):
-        return True
-
-    text = page_text.lower()
-
-    auth_phrases = [
-        "log in to your account",
-        "sign in to your account",
-        "please log in",
-        "please sign in",
-    ]
-
-    return any(
-        phrase in text
-        for phrase in auth_phrases
-    )
 
 
 # ============================================================
@@ -383,7 +633,7 @@ def build_telegram_message(
     url: str,
 ):
     """
-    Build the Telegram message containing the current state.
+    Build Telegram message containing the current state.
     """
 
     emoji = {
@@ -416,7 +666,14 @@ def monitor():
     """
     Run one monitoring cycle.
 
-    Every execution sends the current state to Telegram.
+    Every execution:
+
+    1. Starts a completely fresh browser.
+    2. Logs into ECAS.
+    3. Waits for MFA approval.
+    4. Opens the training page.
+    5. Classifies the page.
+    6. Sends the result to Telegram.
     """
 
     validate_config()
@@ -428,7 +685,7 @@ def monitor():
     print()
 
     print(
-        "URL:",
+        "Training URL:",
         TRAINING_URL,
     )
 
@@ -439,12 +696,12 @@ def monitor():
         try:
 
             # ------------------------------------------------
-            # Launch browser
+            # Launch completely fresh browser
             # ------------------------------------------------
 
             print()
             print(
-                "Launching browser..."
+                "Launching fresh browser..."
             )
 
             browser = p.chromium.launch(
@@ -454,10 +711,15 @@ def monitor():
                 ],
             )
 
+            # ------------------------------------------------
+            # Fresh browser context
+            #
+            # IMPORTANT:
+            # No storage_state.
+            # No auth_state.json.
+            # ------------------------------------------------
+
             context = browser.new_context(
-                storage_state=str(
-                    AUTH_FILE.absolute()
-                ),
                 viewport={
                     "width": 1440,
                     "height": 1000,
@@ -467,11 +729,48 @@ def monitor():
             page = context.new_page()
 
             # ------------------------------------------------
-            # Open page
+            # ECAS authentication
             # ------------------------------------------------
 
+            authenticated = authenticate_with_ecas(
+                page
+            )
+
+            if not authenticated:
+
+                print()
+                print(
+                    "ECAS authentication failed or timed out."
+                )
+
+                send_telegram(
+                    build_telegram_message(
+                        status="UNKNOWN",
+                        confidence=1.0,
+                        reason=(
+                            "ECAS authentication failed "
+                            "or MFA approval timed out."
+                        ),
+                        evidence="",
+                        url=page.url,
+                    )
+                )
+
+                return
+
+            # ------------------------------------------------
+            # Open training page
+            # ------------------------------------------------
+
+            print()
+            print("=" * 70)
+            print("OPENING TRAINING PAGE")
+            print("=" * 70)
+            print()
+
             print(
-                "Opening page..."
+                "Opening:",
+                TRAINING_URL,
             )
 
             try:
@@ -485,7 +784,7 @@ def monitor():
             except PlaywrightTimeoutError:
 
                 print(
-                    "Page load timed out."
+                    "Training page load timed out."
                 )
 
                 send_telegram(
@@ -554,11 +853,14 @@ def monitor():
 
             current_url = page.url
 
+            print()
             print(
                 "Final URL:",
                 current_url,
             )
 
+            page.locator("xpath=//*[@id='showAccountDetailsForm']/input[2]").click()
+            time.sleep(5)
             # ------------------------------------------------
             # Extract page text
             # ------------------------------------------------
@@ -573,7 +875,9 @@ def monitor():
                     build_telegram_message(
                         status="UNKNOWN",
                         confidence=1.0,
-                        reason="Page contains no readable text.",
+                        reason=(
+                            "Page contains no readable text."
+                        ),
                         evidence="",
                         url=current_url,
                     )
@@ -585,36 +889,6 @@ def monitor():
                 "Page text length:",
                 len(page_text),
             )
-
-            # ------------------------------------------------
-            # Authentication check
-            # ------------------------------------------------
-
-            if is_authentication_page(
-                current_url,
-                page_text,
-            ):
-
-                print(
-                    "Authentication appears to have expired."
-                )
-
-                send_telegram(
-                    build_telegram_message(
-                        status="UNKNOWN",
-                        confidence=1.0,
-                        reason=(
-                            "The saved authentication state "
-                            "appears to have expired."
-                        ),
-                        evidence=(
-                            "Authentication/login page detected."
-                        ),
-                        url=current_url,
-                    )
-                )
-
-                return
 
             # ------------------------------------------------
             # AI classification
@@ -703,6 +977,11 @@ def monitor():
         finally:
 
             if browser:
+
+                print()
+                print(
+                    "Closing browser..."
+                )
 
                 browser.close()
 

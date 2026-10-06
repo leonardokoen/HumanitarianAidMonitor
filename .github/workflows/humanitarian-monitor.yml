@@ -12,30 +12,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
+      - name: Build Docker image
         run: |
-          python -m pip install --upgrade pip
-          pip install playwright requests python-dotenv openai
+          docker build \
+            -t humanitarian-aid-monitor \
+            .
 
-      - name: Install Playwright Chromium
-        run: |
-          playwright install --with-deps chromium
-
-      - name: Run humanitarian aid monitor
+      - name: Run monitor
         env:
-          TRAINING_URL: https://youth.europa.eu/solidarity/dashboard/training-humanitarian-aid_en
-
           ECAS_USERNAME: ${{ secrets.ECAS_USERNAME }}
           ECAS_PASSWORD: ${{ secrets.ECAS_PASSWORD }}
+
+          TRAINING_URL: https://youth.europa.eu/solidarity/dashboard/training-humanitarian-aid_en
 
           AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -46,4 +38,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: |
-          python monitor.py
+          docker run --rm \
+            -e ECAS_USERNAME \
+            -e ECAS_PASSWORD \
+            -e TRAINING_URL \
+            -e AZURE_OPENAI_ENDPOINT \
+            -e AZURE_OPENAI_API_KEY \
+            -e AZURE_OPENAI_API_VERSION \
+            -e AZURE_OPENAI_DEPLOYMENT \
+            -e TELEGRAM_BOT_TOKEN \
+            -e TELEGRAM_CHAT_ID \
+            humanitarian-aid-monitor

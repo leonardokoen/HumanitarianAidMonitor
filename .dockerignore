@@ -1,0 +1,13 @@
+.git
+.github
+__pycache__
+*.pyc
+.env
+auth_state.json
+README.md
+.python-versiom
+pyproject.toml
+save_auth.py
+state.json
+test_auth.py
+uv.lock
